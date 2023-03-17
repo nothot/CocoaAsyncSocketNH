@@ -3030,24 +3030,23 @@ enum GCDAsyncSocketConfig
 	aStateIndex = stateIndex;
 	#endif
 	
-	// Setup read/write streams (as workaround for specific shortcomings in the iOS platform)
-	// 
-	// Note:
-	// There may be configuration options that must be set by the delegate before opening the streams.
-	// The primary example is the kCFStreamNetworkServiceTypeVoIP flag, which only works on an unopened stream.
-	// 
-	// Thus we wait until after the socket:didConnectToHost:port: delegate method has completed.
-	// This gives the delegate time to properly configure the streams if needed.
-	
+    /**
+     启动读写数据流（在最新的network framework中，这种读写数据流的方式已经有了替代，see CFStreamCreatePairWithSocket）
+     在某些时候，创建流之后，打开流之前，需要对流做一些配置，例如设置kCFStreamNetworkServiceTypeVoIP选项，因此这里将流程一分为三：
+     1. 创建读写数据流
+     2. 通过代理回调外部，给外部配置流的机会
+     3. 打开读写数据流
+     */
 	dispatch_block_t SetupStreamsPart1 = ^{
 		#if TARGET_OS_IPHONE
-		
+		// 创建读写数据流
 		if (![self createReadAndWriteStream])
 		{
 			[self closeWithError:[self otherError:@"Error creating CFStreams"]];
 			return;
 		}
 		
+        // 设置读写数据流的回调，在回调中可以执行数据的读写操作
 		if (![self registerForStreamCallbacksIncludingReadWrite:NO])
 		{
 			[self closeWithError:[self otherError:@"Error in CFStreamSetClient"]];
@@ -7904,13 +7903,14 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	
 	NSAssert(dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey), @"Must be dispatched on socketQueue");
 	
-	
+	// 如果流已存在，则直接返回成功
 	if (readStream || writeStream)
 	{
 		// Streams already created
 		return YES;
 	}
 	
+    // 获取当前socket描述符
 	int socketFD = (socket4FD != SOCKET_NULL) ? socket4FD : (socket6FD != SOCKET_NULL) ? socket6FD : socketUN;
 	
 	if (socketFD == SOCKET_NULL)
@@ -7919,6 +7919,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 		return NO;
 	}
 	
+    // 如果当前socket处于未连接状态，那么直接返回失败
 	if (![self isConnected])
 	{
 		// Cannot create streams until file descriptor is connected
@@ -7927,6 +7928,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	
 	LogVerbose(@"Creating read and write stream...");
 	
+    // 创建和当前socket配对的读写数据流
 	CFStreamCreatePairWithSocket(NULL, (CFSocketNativeHandle)socketFD, &readStream, &writeStream);
 	
 	// The kCFStreamPropertyShouldCloseNativeSocket property should be false by default (for our case).
