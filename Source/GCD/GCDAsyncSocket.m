@@ -2367,7 +2367,7 @@ enum GCDAsyncSocketConfig
         int aStateIndex = self->stateIndex;
 		__weak GCDAsyncSocket *weakSelf = self;
         
-		// 在并发队列中异步进行DNS查询，根据host拿到实际的IP地址数组
+		// 在并发队列中异步根据要连接的IP和端口号拿到实际的地址结构体数组
 		dispatch_queue_t globalConcurrentQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
 		dispatch_async(globalConcurrentQueue, ^{ @autoreleasepool {
 		#pragma clang diagnostic push
@@ -2405,7 +2405,7 @@ enum GCDAsyncSocketConfig
 				}
 				
 				dispatch_async(strongSelf->socketQueue, ^{ @autoreleasepool {
-					// 获取IP地址之后，回到socket队列，正式发起连接
+					// 获取地址信息之后，回到socket队列，正式发起连接
 					[strongSelf lookup:aStateIndex didSucceedWithAddress4:address4 address6:address6];
 				}});
 			}
@@ -3064,6 +3064,7 @@ enum GCDAsyncSocketConfig
 			return;
 		}
 		
+        // 将流增加到runloop
 		if (![self addStreamsToRunLoop])
 		{
 			[self closeWithError:[self otherError:@"Error in CFStreamScheduleWithRunLoop"]];
@@ -3086,7 +3087,7 @@ enum GCDAsyncSocketConfig
 	NSURL *url = [self connectedUrl];
 	
 	__strong id<GCDAsyncSocketDelegate> theDelegate = delegate;
-
+    // 通知代理，socket连接成功
 	if (delegateQueue && host != nil && [theDelegate respondsToSelector:@selector(socket:didConnectToHost:port:)])
 	{
 		SetupStreamsPart1();
@@ -3121,12 +3122,29 @@ enum GCDAsyncSocketConfig
 		SetupStreamsPart2();
 	}
 		
-	// Get the connected socket
+	// Get the connected socket 获取已连接的socket描述符
 	
 	int socketFD = (socket4FD != SOCKET_NULL) ? socket4FD : (socket6FD != SOCKET_NULL) ? socket6FD : socketUN;
 	
-	// Enable non-blocking IO on the socket
+	// Enable non-blocking IO on the socket 设置socket为非阻塞IO工作模式
 	
+    /**
+     关于5种I/O模型
+     1）阻塞I/O：
+     简单举个例子，比如我们调用read()去读取消息，如果是在阻塞模式下，我们会一直等待，直到有消息到来为止。
+     很多小伙伴可能又要说了，这有什么不可以，我们新开辟一条线程，让它等着不就行了，看起来确实没什么不可以。
+     那是因为你仅仅是站在客户端的角度上来看。试想如果我们服务端也这么做，那岂不是有多少个socket连接，我们得开辟多少个线程去做阻塞IO？
+     2）非阻塞I/O
+     于是就有了非阻塞的概念，当我们去read()的时候，直接返回结果，这样在很大概率下，是并没有消息给我们读的。这时候函数就会错误返回-1，并将errno设置为 EWOULDBLOCK，意为IO并没有数据。
+     这时候就需要我们自己有一个机制，能知道什么时候有数据，在去调用read()。有一个很傻的方式就是不停的循环去调用这个函数，这样有数据来，我们第一时间就读到了。
+     3）I/O复用模式
+     I/O复用模式是阻塞I/O的改进版，它在read之前，会先去调用select去遍历所有的socket，看哪一个有消息。当然这个过程是阻塞的，直到有消息返回为止。然后在去调用read，阻塞的方式去读取从系统内核中去读取这条消息到进程中来。
+     4）信号驱动I/O
+     信号驱动I/O是一个半异步的I/O模式，它首先会调用一个系统sginal相关的函数，把socket和信号绑定起来，然后不管有没有消息直接返回(这一步非阻塞)。这时候系统内核会去检查socket是否有可用数据。有的话则发送该信号给进程，然后进程在去调用read阻塞式的从系统内核读取数据到进程中来（这一步阻塞）。
+     5）可能聪明的你已经想到了更好的解决方式，这就对了，这就是我们第5种IO模式：异步I/O ,它和第4步一样，也是调用sginal相关函数，把socket和信号绑定起来，同时绑定起来的还有一块数据缓冲区buffer。然后无论有没有数据直接返回（非阻塞）。而系统内核会去检查是否有可用数据，一旦有可用数据，则触发信号，并且把数据填充到我们之前提供的数据缓冲区buffer中。这样我们进程被信号触发，并且直接能从buffer中读取到数据，整个过程没有任何阻塞。
+     
+     GCDAsyncSocket用的便是第五种方式
+     */
 	int result = fcntl(socketFD, F_SETFL, O_NONBLOCK);
 	if (result == -1)
 	{
@@ -3136,7 +3154,7 @@ enum GCDAsyncSocketConfig
 		return;
 	}
 	
-	// Setup our read/write sources
+	// Setup our read/write sources 为新建的socket启动读写source，通过source处理读写事件
 	
 	[self setupReadAndWriteSourcesForNewlyConnectedSocket:socketFD];
 	
@@ -4109,6 +4127,7 @@ enum GCDAsyncSocketConfig
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
+ * 获取本机的IP地址信息
  * Finds the address of an interface description.
  * An inteface description may be an interface name (en0, en1, lo0) or corresponding IP (192.168.4.34).
  * 
@@ -4127,9 +4146,11 @@ enum GCDAsyncSocketConfig
 	
 	NSString *interface = nil;
 	
+    // 将interface分割，如果count>1，说明存在端口号
 	NSArray *components = [interfaceDescription componentsSeparatedByString:@":"];
 	if ([components count] > 0)
 	{
+        // 取IP
 		NSString *temp = [components objectAtIndex:0];
 		if ([temp length] > 0)
 		{
@@ -4138,7 +4159,9 @@ enum GCDAsyncSocketConfig
 	}
 	if ([components count] > 1 && port == 0)
 	{
+        // 取端口号
 		NSString *temp = [components objectAtIndex:1];
+        // 将字符串形式的端口号转为long类型，base指定10表示按10进制转，指定16表示按16进制转
 		long portL = strtol([temp UTF8String], NULL, 10);
 		
 		if (portL > 0 && portL <= UINT16_MAX)
@@ -4147,6 +4170,11 @@ enum GCDAsyncSocketConfig
 		}
 	}
 	
+    /**
+     如果外部没有设置本机IP地址（一般情况下，外部不会主动设置本机IP地址），那么直接IP地址设置为INADDR_ANY，即0.0.0.0，这表示
+     可使用本机的任意IP地址。由于单个计算机可能存在多个网卡，那么也就对应存在多个可用IP，INADDR_ANY泛指本机IP，可在
+     连接时选用任意可用IP进行连接
+     */
 	if (interface == nil)
 	{
 		// ANY address
@@ -4155,17 +4183,17 @@ enum GCDAsyncSocketConfig
 		memset(&sockaddr4, 0, sizeof(sockaddr4));
 		
 		sockaddr4.sin_len         = sizeof(sockaddr4);
-		sockaddr4.sin_family      = AF_INET;
-		sockaddr4.sin_port        = htons(port);
-		sockaddr4.sin_addr.s_addr = htonl(INADDR_ANY);
+		sockaddr4.sin_family      = AF_INET;    // 使用IPv4
+		sockaddr4.sin_port        = htons(port);    // 将16位的端口转为网络字节序（大端）
+		sockaddr4.sin_addr.s_addr = htonl(INADDR_ANY);  // 将32位的IP地址转为网络字节序（大端）
 		
 		struct sockaddr_in6 sockaddr6;
 		memset(&sockaddr6, 0, sizeof(sockaddr6));
 		
 		sockaddr6.sin6_len       = sizeof(sockaddr6);
-		sockaddr6.sin6_family    = AF_INET6;
-		sockaddr6.sin6_port      = htons(port);
-		sockaddr6.sin6_addr      = in6addr_any;
+		sockaddr6.sin6_family    = AF_INET6;    // 使用IPv6
+		sockaddr6.sin6_port      = htons(port); // 将16位的端口转为网络字节序（大端）
+		sockaddr6.sin6_addr      = in6addr_any; // 使用任意IP地址
 		
 		addr4 = [NSMutableData dataWithBytes:&sockaddr4 length:sizeof(sockaddr4)];
 		addr6 = [NSMutableData dataWithBytes:&sockaddr6 length:sizeof(sockaddr6)];
@@ -4173,6 +4201,10 @@ enum GCDAsyncSocketConfig
 	else if ([interface isEqualToString:@"localhost"] || [interface isEqualToString:@"loopback"])
 	{
 		// LOOPBACK address
+        /**
+         外部设置本机IP为回环地址INADDR_LOOPBACK，对应127.0.0.1，实际上所有127.*网络段的都属于回环地址，消息会
+         直接发到本机，并不会进入网络中传输
+         */
 		
 		struct sockaddr_in sockaddr4;
 		memset(&sockaddr4, 0, sizeof(sockaddr4));
@@ -4195,16 +4227,19 @@ enum GCDAsyncSocketConfig
 	}
 	else
 	{
+        // 外部指定了本机地址，那么获取本机所有的网络地址，查找若与给定地址匹配，那么保存在传入的IPv4和IPv6地址指针里
 		const char *iface = [interface UTF8String];
 		
 		struct ifaddrs *addrs;
 		const struct ifaddrs *cursor;
-		
+        
+		// 获取本机所有的网卡IP地址和Mac地址，链表形式，链表节点要么是IP地址，要么是Mac地址
 		if ((getifaddrs(&addrs) == 0))
 		{
 			cursor = addrs;
 			while (cursor != NULL)
 			{
+                // 当前节点是TCP/IP协议簇-IPv4信息
 				if ((addr4 == nil) && (cursor->ifa_addr->sa_family == AF_INET))
 				{
 					// IPv4
@@ -4214,7 +4249,7 @@ enum GCDAsyncSocketConfig
 					
 					if (strcmp(cursor->ifa_name, iface) == 0)
 					{
-						// Name match
+						// Name match 接口名匹配
 						
 						nativeAddr4.sin_port = htons(port);
 						
@@ -4223,12 +4258,12 @@ enum GCDAsyncSocketConfig
 					else
 					{
 						char ip[INET_ADDRSTRLEN];
-						
+						// 将网络IP地址结构转为标准的字符串形式ip
 						const char *conversion = inet_ntop(AF_INET, &nativeAddr4.sin_addr, ip, sizeof(ip));
 						
 						if ((conversion != NULL) && (strcmp(ip, iface) == 0))
 						{
-							// IP match
+							// IP match 字符串形式的IP匹配
 							
 							nativeAddr4.sin_port = htons(port);
 							
@@ -4238,7 +4273,7 @@ enum GCDAsyncSocketConfig
 				}
 				else if ((addr6 == nil) && (cursor->ifa_addr->sa_family == AF_INET6))
 				{
-					// IPv6
+					// IPv6 的处理同上方IPv4
 					
 					struct sockaddr_in6 nativeAddr6;
 					memcpy(&nativeAddr6, cursor->ifa_addr, sizeof(nativeAddr6));
@@ -4297,6 +4332,7 @@ enum GCDAsyncSocketConfig
 
 - (void)setupReadAndWriteSourcesForNewlyConnectedSocket:(int)socketFD
 {
+    // 创建dispatch source，读写source会监听socket句柄，一旦有数据可以读或可以写，则触发回调事件
 	readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, socketFD, 0, socketQueue);
 	writeSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_WRITE, socketFD, 0, socketQueue);
 	
@@ -4304,6 +4340,7 @@ enum GCDAsyncSocketConfig
 	
 	__weak GCDAsyncSocket *weakSelf = self;
 	
+    // 设置读 source在事件触发时回调的block，block会在socket queue中执行
 	dispatch_source_set_event_handler(readSource, ^{ @autoreleasepool {
 	#pragma clang diagnostic push
 	#pragma clang diagnostic warning "-Wimplicit-retain-self"
@@ -4313,17 +4350,21 @@ enum GCDAsyncSocketConfig
 		
 		LogVerbose(@"readEventBlock");
 		
+        // 从source中获取可读的data的长度
 		strongSelf->socketFDBytesAvailable = dispatch_source_get_data(strongSelf->readSource);
 		LogVerbose(@"socketFDBytesAvailable: %lu", strongSelf->socketFDBytesAvailable);
 		
 		if (strongSelf->socketFDBytesAvailable > 0)
+            // 当前socket有剩余未读取得部分data，进入读取data的流程
 			[strongSelf doReadData];
 		else
+            // 当前socket已没有剩余可读的data，
 			[strongSelf doReadEOF];
 		
 	#pragma clang diagnostic pop
 	}});
 	
+    // 设置写 source在事件触发时回调的block，block会在socket queue中执行
 	dispatch_source_set_event_handler(writeSource, ^{ @autoreleasepool {
 	#pragma clang diagnostic push
 	#pragma clang diagnostic warning "-Wimplicit-retain-self"
@@ -4334,13 +4375,15 @@ enum GCDAsyncSocketConfig
 		LogVerbose(@"writeEventBlock");
 		
 		strongSelf->flags |= kSocketCanAcceptBytes;
+        // 进入写数据流程
 		[strongSelf doWriteData];
 		
 	#pragma clang diagnostic pop
 	}});
 	
-	// Setup cancel handlers
+	// Setup cancel handlers 接下来设置读写source取消时的block操作
 	
+    // 读写source存在的情况下，socket不应该关闭，这里socket引用计数设置为2，当读写source均取消时，引用计数降为0，触发socket的关闭
 	__block int socketFDRefCount = 2;
 	
 	#if !OS_OBJECT_USE_OBJC
@@ -4391,12 +4434,14 @@ enum GCDAsyncSocketConfig
 	// We will not be able to read until data arrives.
 	// But we should be able to write immediately.
 	
+    // 初始化当前可读长度为0，并标记当前状态为read source激活状态，dispatch_resume会激活source
 	socketFDBytesAvailable = 0;
 	flags &= ~kReadSourceSuspended;
 	
 	LogVerbose(@"dispatch_resume(readSource)");
 	dispatch_resume(readSource);
 	
+    // 标记当前进入可接受输入状态，同时write source为挂起状态。一个source创建后默认就是挂起状态，这里不需suspend
 	flags |= kSocketCanAcceptBytes;
 	flags |= kWriteSourceSuspended;
 }
@@ -7928,12 +7973,13 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	
 	LogVerbose(@"Creating read and write stream...");
 	
-    // 创建和当前socket配对的读写数据流
+    // 创建读写数据流并与socket绑定
 	CFStreamCreatePairWithSocket(NULL, (CFSocketNativeHandle)socketFD, &readStream, &writeStream);
 	
 	// The kCFStreamPropertyShouldCloseNativeSocket property should be false by default (for our case).
 	// But let's not take any chances.
 	
+    // 设置stream不会随着socket的生命周期（close,release）而变化
 	if (readStream)
 		CFReadStreamSetProperty(readStream, kCFStreamPropertyShouldCloseNativeSocket, kCFBooleanFalse);
 	if (writeStream)
@@ -7975,6 +8021,10 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	streamContext.release = nil;
 	streamContext.copyDescription = nil;
 	
+    /**
+     监听流的哪些事件，这里指定了错误发生和流结束两种事件，而kCFStreamEventHasBytesAvailable事件没有监听，这导致
+     当有可读数据的时候，并不会触发流的回调，实际上，在有可读或可写数据时，该框架采用读写source来触发事件
+     */
 	CFOptionFlags readStreamEvents = kCFStreamEventErrorOccurred | kCFStreamEventEndEncountered;
 	if (includeReadWrite)
 		readStreamEvents |= kCFStreamEventHasBytesAvailable;
@@ -7983,7 +8033,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	{
 		return NO;
 	}
-	
+	// 写和读采用类似的处理，同上
 	CFOptionFlags writeStreamEvents = kCFStreamEventErrorOccurred | kCFStreamEventEndEncountered;
 	if (includeReadWrite)
 		writeStreamEvents |= kCFStreamEventCanAcceptBytes;
@@ -7993,6 +8043,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 		return NO;
 	}
 	
+    // 到这里读写流回调均已设置完毕
 	return YES;
 }
 
@@ -8003,6 +8054,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	NSAssert(dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey), @"Must be dispatched on socketQueue");
 	NSAssert((readStream != NULL && writeStream != NULL), @"Read/Write stream is null");
 	
+    // 如果流尚未增加到runloop里
 	if (!(flags & kAddedStreamsToRunLoop))
 	{
 		LogVerbose(@"Adding streams to runloop...");
@@ -8056,7 +8108,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	if ((readStatus == kCFStreamStatusNotOpen) || (writeStatus == kCFStreamStatusNotOpen))
 	{
 		LogVerbose(@"Opening read and write stream...");
-		
+		// 打开读写流
 		BOOL r1 = CFReadStreamOpen(readStream);
 		BOOL r2 = CFWriteStreamOpen(writeStream);
 		
@@ -8313,7 +8365,10 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Class Utilities
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
+/**
+ 根据host和post获取server的地址信息结构体数据，包含IPv4和IPv6地址，并且如果一台服务器有多个网卡，那么会对应多个v4或v6的地址，因此这里返回的
+ 是所有的地址信息结构体，地址结构体可以被socket连接时直接使用
+ */
 + (NSMutableArray *)lookupHost:(NSString *)host port:(uint16_t)port error:(NSError **)errPtr
 {
 	LogTrace();
@@ -8321,6 +8376,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	NSMutableArray *addresses = nil;
 	NSError *error = nil;
 	
+    // 如果要连接的是本机，那么直接将本机的IPv4和IPv6地址结构体放入数组中返回
 	if ([host isEqualToString:@"localhost"] || [host isEqualToString:@"loopback"])
 	{
 		// Use LOOPBACK address
@@ -8354,6 +8410,10 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 		
 		struct addrinfo hints, *res, *res0;
 		
+        /**
+         hints是配置信息结构体，在获取server地址结构体信息时，传入hints可指定返回匹配的地址信息
+         例如，hints指定tcp数据流，那么返回的地址信息中就不会出现适用于udp数据报类型的地址信息了
+         */
 		memset(&hints, 0, sizeof(hints));
 		hints.ai_family   = PF_UNSPEC;
 		hints.ai_socktype = SOCK_STREAM;
@@ -8367,6 +8427,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 		}
 		else
 		{
+            // 获取地址信息成功，计算可用的v4或v6地址的总数
 			NSUInteger capacity = 0;
 			for (res = res0; res; res = res->ai_next)
 			{
@@ -8377,6 +8438,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 			
 			addresses = [NSMutableArray arrayWithCapacity:capacity];
 			
+            // 将v4或v6地址装入数组中
 			for (res = res0; res; res = res->ai_next)
 			{
 				if (res->ai_family == AF_INET)
