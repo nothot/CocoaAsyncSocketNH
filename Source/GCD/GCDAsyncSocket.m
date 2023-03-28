@@ -346,16 +346,16 @@ enum GCDAsyncSocketConfig
 @interface GCDAsyncReadPacket : NSObject
 {
   @public
-	NSMutableData *buffer;
-	NSUInteger startOffset;
-	NSUInteger bytesDone;
-	NSUInteger maxLength;
-	NSTimeInterval timeout;
-	NSUInteger readLength;
-	NSData *term;
-	BOOL bufferOwner;
-	NSUInteger originalBufferLength;
-	long tag;
+	NSMutableData *buffer;  // 数据要读取到的容器
+	NSUInteger startOffset; // 数据在容器中开始写的偏移
+	NSUInteger bytesDone;   // 已写入到buffer的字节数
+	NSUInteger maxLength;   // 读取的最大长度
+	NSTimeInterval timeout; // 超时时间
+	NSUInteger readLength;  // 当次需要读取的长度（本次read）
+	NSData *term;           // 数据包的边界标识
+	BOOL bufferOwner;       // 是否是buffer的拥有者，如果外部传入buffer，该类不拥有，值为NO，外部未传，该类自动创建buffer，值为YES
+	NSUInteger originalBufferLength;    // 原始传过来的buffer中数据长度
+	long tag;               // 数据包的标签
 }
 - (instancetype)initWithData:(NSMutableData *)d
                  startOffset:(NSUInteger)s
@@ -1465,7 +1465,7 @@ enum GCDAsyncSocketConfig
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#pragma mark Accepting
+#pragma mark Accepting 服务端accept流程
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 - (BOOL)acceptOnPort:(uint16_t)port error:(NSError **)errPtr
@@ -1486,8 +1486,12 @@ enum GCDAsyncSocketConfig
 	// CreateSocket Block
 	// This block will be invoked within the dispatch block below.
 	
+    /**
+     创建socket的block
+     该block负责创建socket，绑定本机地址，并监听端口
+    */
 	int(^createSocket)(int, NSData*) = ^int (int domain, NSData *interfaceAddr) {
-		
+        // 创建TCP socket
 		int socketFD = socket(domain, SOCK_STREAM, 0);
 		
 		if (socketFD == SOCKET_NULL)
@@ -1500,7 +1504,7 @@ enum GCDAsyncSocketConfig
 		
 		int status;
 		
-		// Set socket options
+		// Set socket options 设置非IO阻塞
 		
 		status = fcntl(socketFD, F_SETFL, O_NONBLOCK);
 		if (status == -1)
@@ -1513,6 +1517,7 @@ enum GCDAsyncSocketConfig
 			return SOCKET_NULL;
 		}
 		
+        // 设置端口释放后可立即重用，处于time_wait状态有效
 		int reuseOn = 1;
 		status = setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuseOn, sizeof(reuseOn));
 		if (status == -1)
@@ -1525,7 +1530,7 @@ enum GCDAsyncSocketConfig
 			return SOCKET_NULL;
 		}
 		
-		// Bind socket
+		// Bind socket 将socket与本机地址绑定
 		
 		status = bind(socketFD, (const struct sockaddr *)[interfaceAddr bytes], (socklen_t)[interfaceAddr length]);
 		if (status == -1)
@@ -1538,7 +1543,7 @@ enum GCDAsyncSocketConfig
 			return SOCKET_NULL;
 		}
 		
-		// Listen
+		// Listen 监听端口，1024表示该端口维护的请求队列中请求最大数目
 		
 		status = listen(socketFD, 1024);
 		if (status == -1)
@@ -1558,6 +1563,7 @@ enum GCDAsyncSocketConfig
 	
 	dispatch_block_t block = ^{ @autoreleasepool {
 		
+        // 代理检查
         if (self->delegate == nil) // Must have delegate set
 		{
 			NSString *msg = @"Attempting to accept without a delegate. Set a delegate first.";
@@ -1574,6 +1580,7 @@ enum GCDAsyncSocketConfig
 			return_from_block;
 		}
 		
+        // 是否允许IPv4或IPv6连接
         BOOL isIPv4Disabled = (self->config & kIPv4Disabled) ? YES : NO;
         BOOL isIPv6Disabled = (self->config & kIPv6Disabled) ? YES : NO;
 		
@@ -1585,6 +1592,7 @@ enum GCDAsyncSocketConfig
 			return_from_block;
 		}
 		
+        // 在响应socket连接请求之前，自身socket连接必须确保是连接状态
 		if (![self isDisconnected]) // Must be disconnected
 		{
 			NSString *msg = @"Attempting to accept while connected or accepting connections. Disconnect first.";
@@ -1593,11 +1601,11 @@ enum GCDAsyncSocketConfig
 			return_from_block;
 		}
 		
-		// Clear queues (spurious read/write requests post disconnect)
+		// Clear queues (spurious read/write requests post disconnect) 清空读写队列
         [self->readQueue removeAllObjects];
         [self->writeQueue removeAllObjects];
 		
-		// Resolve interface from description
+		// Resolve interface from description 获取本机IPv4和IPv6地址，这个地址是结构体形式的地址，可被socket直接使用
 		
 		NSMutableData *interface4 = nil;
 		NSMutableData *interface6 = nil;
@@ -1631,7 +1639,7 @@ enum GCDAsyncSocketConfig
 		BOOL enableIPv4 = !isIPv4Disabled && (interface4 != nil);
 		BOOL enableIPv6 = !isIPv6Disabled && (interface6 != nil);
 		
-		// Create sockets, configure, bind, and listen
+		// Create sockets, configure, bind, and listen 使用IPv4创建socket，并完成绑定和监听操作
 		
 		if (enableIPv4)
 		{
@@ -1648,6 +1656,10 @@ enum GCDAsyncSocketConfig
 		{
 			LogVerbose(@"Creating IPv6 socket");
 			
+            /**
+             如果IPv4打开且未设置端口号，那么系统会自动选择一个空闲的端口号，这时需要确保IPv6连接时绑定并监听同一个端口号，
+             因此这里会先取IPv4的连接的端口号，并用于IPv6
+             */
 			if (enableIPv4 && (port == 0))
 			{
 				// No specific port was specified, so we allowed the OS to pick an available port for us.
@@ -1656,7 +1668,7 @@ enum GCDAsyncSocketConfig
 				struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)[interface6 mutableBytes];
 				addr6->sin6_port = htons([self localPort4]);
 			}
-			
+			// 使用IPv4创建socket，并完成绑定和监听操作
             self->socket6FD = createSocket(AF_INET6, interface6);
 			
             if (self->socket6FD == SOCKET_NULL)
@@ -1672,7 +1684,11 @@ enum GCDAsyncSocketConfig
 			}
 		}
 		
-		// Create accept sources
+		/**
+         Create accept sources
+         创建IPv4和IPv6的source，监听read事件，当socket有数据可读，source回调block里进行accept操作
+         取消source会进行关闭socket操作
+         */
 		
 		if (enableIPv4)
 		{
@@ -1692,11 +1708,12 @@ enum GCDAsyncSocketConfig
 				
 				LogVerbose(@"event4Block");
 				
-				unsigned long i = 0;
-				unsigned long numPendingConnections = dispatch_source_get_data(acceptSource);
+				unsigned long i = 0;    // 已处理的连接数
+				unsigned long numPendingConnections = dispatch_source_get_data(acceptSource);   // 获取待处理的连接请求数
 				
 				LogVerbose(@"numPendingConnections: %lu", numPendingConnections);
 				
+                // 通过while循环处理待连接请求，直到处理完所有待连接请求，while停止
 				while ([strongSelf doAccept:socketFD] && (++i < numPendingConnections));
 				
 			#pragma clang diagnostic pop
@@ -1722,6 +1739,7 @@ enum GCDAsyncSocketConfig
             dispatch_resume(self->accept4Source);
 		}
 		
+        // IPv6 source，同上
 		if (enableIPv6)
 		{
             self->accept6Source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, self->socket6FD, 0, self->socketQueue);
@@ -1790,6 +1808,7 @@ enum GCDAsyncSocketConfig
 	return result;
 }
 
+// unix domain socket 绑定的是一个本地文件路径
 - (BOOL)acceptOnUrl:(NSURL *)url error:(NSError **)errPtr
 {
 	LogTrace();
@@ -1799,9 +1818,13 @@ enum GCDAsyncSocketConfig
 	
 	// CreateSocket Block
 	// This block will be invoked within the dispatch block below.
-	
+    
+	/**
+     创建socket的block
+     该block负责创建socket，绑定本机地址，并监听端口
+    */
 	int(^createSocket)(int, NSData*) = ^int (int domain, NSData *interfaceAddr) {
-		
+		// 创建TCP socket
 		int socketFD = socket(domain, SOCK_STREAM, 0);
 		
 		if (socketFD == SOCKET_NULL)
@@ -1814,7 +1837,7 @@ enum GCDAsyncSocketConfig
 		
 		int status;
 		
-		// Set socket options
+		// Set socket options 设置socket是非IO阻塞模式
 		
 		status = fcntl(socketFD, F_SETFL, O_NONBLOCK);
 		if (status == -1)
@@ -1827,6 +1850,7 @@ enum GCDAsyncSocketConfig
 			return SOCKET_NULL;
 		}
 		
+        // 设置socket在端口释放后可立即重用
 		int reuseOn = 1;
 		status = setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuseOn, sizeof(reuseOn));
 		if (status == -1)
@@ -1839,7 +1863,7 @@ enum GCDAsyncSocketConfig
 			return SOCKET_NULL;
 		}
 		
-		// Bind socket
+		// Bind socket 将创建的socket与本机地址绑定（ip + 端口）
 		
 		status = bind(socketFD, (const struct sockaddr *)[interfaceAddr bytes], (socklen_t)[interfaceAddr length]);
 		if (status == -1)
@@ -1852,7 +1876,7 @@ enum GCDAsyncSocketConfig
 			return SOCKET_NULL;
 		}
 		
-		// Listen
+		// Listen 将socket改为被动监听，第二个参数是指这个端口下维护的socket请求队列，最多容纳的用户请求数，这里设置1024
 		
 		status = listen(socketFD, 1024);
 		if (status == -1)
@@ -1872,6 +1896,7 @@ enum GCDAsyncSocketConfig
 	
 	dispatch_block_t block = ^{ @autoreleasepool {
 		
+        // 一系列的参数检查
         if (self->delegate == nil) // Must have delegate set
 		{
 			NSString *msg = @"Attempting to accept without a delegate. Set a delegate first.";
@@ -1888,6 +1913,7 @@ enum GCDAsyncSocketConfig
 			return_from_block;
 		}
 		
+        // 在接受其他socket请求之前，必须确保socket是连接状态
 		if (![self isDisconnected]) // Must be disconnected
 		{
 			NSString *msg = @"Attempting to accept while connected or accepting connections. Disconnect first.";
@@ -1996,6 +2022,9 @@ enum GCDAsyncSocketConfig
 	return result;	
 }
 
+/**
+ 从socket请求队列里取出一个请求连接，并返回连接的子socket实例
+ */
 - (BOOL)doAccept:(int)parentSocketFD
 {
 	LogTrace();
@@ -2010,7 +2039,7 @@ enum GCDAsyncSocketConfig
 		
 		struct sockaddr_in addr;
 		socklen_t addrLen = sizeof(addr);
-		
+		// 接受一个socket连接请求，返回新连接的socket ID，并获取子socket绑定的地址结构体addr
 		childSocketFD = accept(parentSocketFD, (struct sockaddr *)&addr, &addrLen);
 		
 		if (childSocketFD == -1)
@@ -2021,7 +2050,7 @@ enum GCDAsyncSocketConfig
 		
 		childSocketAddress = [NSData dataWithBytes:&addr length:addrLen];
 	}
-	else if (parentSocketFD == socket6FD)
+	else if (parentSocketFD == socket6FD)   // 同IPv4
 	{
 		socketType = 1;
 		
@@ -2038,7 +2067,7 @@ enum GCDAsyncSocketConfig
 		
 		childSocketAddress = [NSData dataWithBytes:&addr length:addrLen];
 	}
-	else // if (parentSocketFD == socketUN)
+	else // if (parentSocketFD == socketUN) // 同IPv4
 	{
 		socketType = 2;
 		
@@ -2056,7 +2085,7 @@ enum GCDAsyncSocketConfig
 		childSocketAddress = [NSData dataWithBytes:&addr length:addrLen];
 	}
 	
-	// Enable non-blocking IO on the socket
+	// Enable non-blocking IO on the socket 设置新连接的socket为非IO阻塞
 	
 	int result = fcntl(childSocketFD, F_SETFL, O_NONBLOCK);
 	if (result == -1)
@@ -2067,7 +2096,7 @@ enum GCDAsyncSocketConfig
 		return NO;
 	}
 	
-	// Prevent SIGPIPE signals
+	// Prevent SIGPIPE signals 信号
 	
 	int nosigpipe = 1;
 	setsockopt(childSocketFD, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
@@ -2080,7 +2109,7 @@ enum GCDAsyncSocketConfig
 		
 		dispatch_async(delegateQueue, ^{ @autoreleasepool {
 			
-			// Query delegate for custom socket queue
+			// Query delegate for custom socket queue 查询外部是否为新socket设置了专门的处理队列
 			
 			dispatch_queue_t childSocketQueue = NULL;
 			
@@ -2090,7 +2119,7 @@ enum GCDAsyncSocketConfig
 				                                                              onSocket:self];
 			}
 			
-			// Create GCDAsyncSocket instance for accepted socket
+			// Create GCDAsyncSocket instance for accepted socket 为新建的socket连接创建asyncSocket实例
 			
 			GCDAsyncSocket *acceptedSocket = [[[self class] alloc] initWithDelegate:theDelegate
                                                                       delegateQueue:self->delegateQueue
@@ -2108,11 +2137,11 @@ enum GCDAsyncSocketConfig
 			// Setup read and write sources for accepted socket
 			
 			dispatch_async(acceptedSocket->socketQueue, ^{ @autoreleasepool {
-				
+				// 为新接受的socket建立读写source，以便处理该socket的读写事件
 				[acceptedSocket setupReadAndWriteSourcesForNewlyConnectedSocket:childSocketFD];
 			}});
 			
-			// Notify delegate
+			// Notify delegate 通知代理，已经接受了一个新的socket连接
 			
 			if ([theDelegate respondsToSelector:@selector(socket:didAcceptNewSocket:)])
 			{
@@ -4525,7 +4554,7 @@ enum GCDAsyncSocketConfig
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#pragma mark Reading
+#pragma mark Reading ======================读数据
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 - (void)readDataWithTimeout:(NSTimeInterval)timeout tag:(long)tag
@@ -4551,7 +4580,9 @@ enum GCDAsyncSocketConfig
 		LogWarn(@"Cannot read: offset > [buffer length]");
 		return;
 	}
-	
+	/**
+     创建一个读取数据的任务，并将任务加入到读队列里，然后从读队列里出队一个读任务
+     */
 	GCDAsyncReadPacket *packet = [[GCDAsyncReadPacket alloc] initWithData:buffer
 	                                                          startOffset:offset
 	                                                            maxLength:length
@@ -4740,15 +4771,16 @@ enum GCDAsyncSocketConfig
 	NSAssert(dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey), @"Must be dispatched on socketQueue");
 	
 	// If we're not currently processing a read AND we have an available read stream
+    // 当前没有正在进行的读任务，且有有效的读数据流
 	if ((currentRead == nil) && (flags & kConnected))
 	{
 		if ([readQueue count] > 0)
 		{
-			// Dequeue the next object in the write queue
+			// 从队列中取出一个读任务
 			currentRead = [readQueue objectAtIndex:0];
 			[readQueue removeObjectAtIndex:0];
 			
-			
+			// 读队列中遇到TLS标记packet，开启TLS
 			if ([currentRead isKindOfClass:[GCDAsyncSpecialPacket class]])
 			{
 				LogVerbose(@"Dequeued GCDAsyncSpecialPacket");
@@ -4763,10 +4795,10 @@ enum GCDAsyncSocketConfig
 			{
 				LogVerbose(@"Dequeued GCDAsyncReadPacket");
 				
-				// Setup read timer (if needed)
+				// 如果外部设置读超时时间大于0，则启动读取超时计时器
 				[self setupReadTimerWithTimeout:currentRead->timeout];
 				
-				// Immediately read, if possible
+				// 读取数据
 				[self doReadData];
 			}
 		}
@@ -6615,9 +6647,11 @@ enum GCDAsyncSocketConfig
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#pragma mark Security
+#pragma mark Security ======================TLS加密socket
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
+/**
+ 由外部调用，输入tls配置，开启TLS
+ */
 - (void)startTLS:(NSDictionary *)tlsSettings
 {
 	LogTrace();
@@ -6635,17 +6669,21 @@ enum GCDAsyncSocketConfig
         tlsSettings = [NSDictionary dictionary];
     }
 	
+    // 创建一个TLS特殊的任务packet，在读写队列中遇到这种packet会执行特殊额外的操作指令
 	GCDAsyncSpecialPacket *packet = [[GCDAsyncSpecialPacket alloc] initWithTLSSettings:tlsSettings];
 	
 	dispatch_async(socketQueue, ^{ @autoreleasepool {
 		
+        // socket已建立并且尚未开启TLS
         if ((self->flags & kSocketStarted) && !(self->flags & kQueuedTLS) && !(self->flags & kForbidReadsWrites))
 		{
+            // 在读写队列中加入TLS 标记packet
             [self->readQueue addObject:packet];
             [self->writeQueue addObject:packet];
 			
-            self->flags |= kQueuedTLS;
+            self->flags |= kQueuedTLS;  // 更新为TLS状态
 			
+            // 读取TLS的任务，读写队列遇到这个packet会开始做TLS认证，在这个packet之前的包还是不需要认证就可以读写的，这个packet之后的包则启动了TLS
 			[self maybeDequeueRead];
 			[self maybeDequeueWrite];
 		}
@@ -6661,8 +6699,15 @@ enum GCDAsyncSocketConfig
 	// 
 	// We'll know these conditions are met when both kStartingReadTLS and kStartingWriteTLS are set
 	
+    /**
+     必须检测到读写都设置了开启TLS标记，才开启TLS操作
+     */
 	if ((flags & kStartingReadTLS) && (flags & kStartingWriteTLS))
 	{
+        /**
+         TLS包含两种方式，一种是使用基于CFStream的TLS，一种是使用SecureTransport方式的TLS，默认是使用后者的，因为
+         前者使用的加密是过时的，且只能在iOS平台使用。除非外部主动设置使用CFStream方式的TLS
+         */
 		BOOL useSecureTransport = YES;
 		
 		#if TARGET_OS_IPHONE
@@ -6952,6 +6997,9 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	
 	// Create SSLContext, and setup IO callbacks and connection ref
 	
+    /**
+     创建SSL上下文，这里根据SSL配置中的设置确定是服务端还是客户端，然后创建对应的SSL上下文，并且设置基于流式而不是数据报式
+     */
 	NSNumber *isServerNumber = [tlsSettings objectForKey:(__bridge NSString *)kCFStreamSSLIsServer];
 	BOOL isServer = [isServerNumber boolValue];
 	
@@ -6979,6 +7027,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	}
 	#endif
 	
+    // 设置SSL的IO读写回调
 	status = SSLSetIOFuncs(sslContext, &SSLReadFunction, &SSLWriteFunction);
 	if (status != noErr)
 	{
@@ -6986,6 +7035,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
+    // 为SSL设置一个连接，可以是一个socket连接，对象由调用方维护，也需要在SSL握手之前调用
 	status = SSLSetConnection(sslContext, (__bridge SSLConnectionRef)self);
 	if (status != noErr)
 	{
@@ -6993,16 +7043,21 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 
-
+    // 是否应该手动的信任SSL
 	NSNumber *shouldManuallyEvaluateTrust = [tlsSettings objectForKey:GCDAsyncSocketManuallyEvaluateTrust];
 	if ([shouldManuallyEvaluateTrust boolValue])
 	{
+        // server端不允许发生这种情况
 		if (isServer)
 		{
 			[self closeWithError:[self otherError:@"Manual trust validation is not supported for server sockets"]];
 			return;
 		}
 		
+        /**
+         客户端选择了手动信任SSL的方式
+         kSSLSessionOptionBreakOnServerAuth 给应用层一个机会，在SSL握手时，自行决定是否应该信任对端
+         */
 		status = SSLSetSessionOption(sslContext, kSSLSessionOptionBreakOnServerAuth, true);
 		if (status != noErr)
 		{
@@ -7052,7 +7107,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	
 	NSObject *value;
 	
-	// 1. kCFStreamSSLPeerName
+	// 1. kCFStreamSSLPeerName 如果设置了域名，则告诉SSL上下文开启域名验证
 	
 	value = [tlsSettings objectForKey:(__bridge NSString *)kCFStreamSSLPeerName];
 	if ([value isKindOfClass:[NSString class]])
@@ -7077,7 +7132,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
-	// 2. kCFStreamSSLCertificates
+	// 2. kCFStreamSSLCertificates 设置SSL证书链，该值是一个数组，作为SSL服务端必须要设置
 	
 	value = [tlsSettings objectForKey:(__bridge NSString *)kCFStreamSSLCertificates];
 	if ([value isKindOfClass:[NSArray class]])
@@ -7099,7 +7154,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
-	// 3. GCDAsyncSocketSSLPeerID
+	// 3. GCDAsyncSocketSSLPeerID 设置当前SSL会话的对端id，data形式，对系统是透明的，用于唯一确定某一SSL会话的对端
 	
 	value = [tlsSettings objectForKey:GCDAsyncSocketSSLPeerID];
 	if ([value isKindOfClass:[NSData class]])
@@ -7123,7 +7178,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
-	// 4. GCDAsyncSocketSSLProtocolVersionMin
+	// 4. GCDAsyncSocketSSLProtocolVersionMin 设置允许的SSL协议组最小的协议版本
 	
 	value = [tlsSettings objectForKey:GCDAsyncSocketSSLProtocolVersionMin];
 	if ([value isKindOfClass:[NSNumber class]])
@@ -7147,7 +7202,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
-	// 5. GCDAsyncSocketSSLProtocolVersionMax
+	// 5. GCDAsyncSocketSSLProtocolVersionMax 设置允许的SSL协议组最大的协议版本
 	
 	value = [tlsSettings objectForKey:GCDAsyncSocketSSLProtocolVersionMax];
 	if ([value isKindOfClass:[NSNumber class]])
@@ -7215,7 +7270,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
-	// 8. GCDAsyncSocketSSLCipherSuites
+	// 8. GCDAsyncSocketSSLCipherSuites 支持的加密套件
 	
 	value = [tlsSettings objectForKey:GCDAsyncSocketSSLCipherSuites];
 	if ([value isKindOfClass:[NSArray class]])
@@ -7376,7 +7431,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
-	// Setup the sslPreBuffer
+	// Setup the sslPreBuffer 建立加密数据的缓冲区
 	// 
 	// Any data in the preBuffer needs to be moved into the sslPreBuffer,
 	// as this data is now part of the secure read stream.
@@ -7396,7 +7451,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	
 	sslErrCode = lastSSLHandshakeError = noErr;
 	
-	// Start the SSL Handshake process
+	// Start the SSL Handshake process 配置完毕，开始握手
 	
 	[self ssl_continueSSLHandshake];
 }
@@ -7424,6 +7479,9 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		
 		flags |=  kSocketSecure;
 		
+        /**
+         SSL握手完成，通知代理，成功完成了SSL连接
+         */
 		__strong id<GCDAsyncSocketDelegate> theDelegate = delegate;
 
 		if (delegateQueue && [theDelegate respondsToSelector:@selector(socketDidSecure:)])
@@ -7434,6 +7492,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 			}});
 		}
 		
+        // 停止基于source的读写source，开启基于stream的读写
 		[self endCurrentRead];
 		[self endCurrentWrite];
 		
@@ -7444,6 +7503,9 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	{
 		LogVerbose(@"SSLHandshake peerAuthCompleted - awaiting delegate approval");
 		
+        /**
+         对于手动信任的情况，这里从SSL上下文中获取对端的证书，并通过代理回调外部处理证书信任的逻辑
+         */
 		__block SecTrustRef trust = NULL;
 		status = SSLCopyPeerTrust(sslContext, &trust);
 		if (status != noErr)
@@ -7457,6 +7519,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		
 		__weak GCDAsyncSocket *weakSelf = self;
 		
+        // 外部处理之后，根据回调的是否应该信任的结果shouldTrust继续决定后续流程
 		void (^comletionHandler)(BOOL) = ^(BOOL shouldTrust){ @autoreleasepool {
 		#pragma clang diagnostic push
 		#pragma clang diagnostic warning "-Wimplicit-retain-self"
@@ -7501,7 +7564,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 			return;
 		}
 	}
-	else if (status == errSSLWouldBlock)
+	else if (status == errSSLWouldBlock)    // 服务端的结果还未来得及返回
 	{
 		LogVerbose(@"SSLHandshake continues...");
 		
@@ -7509,7 +7572,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		// 
 		// This method will be called again from doReadData or doWriteData.
 	}
-	else
+	else    // 不是以上情况，则意味着出错
 	{
 		[self closeWithError:[self sslError:status]];
 	}
@@ -7534,6 +7597,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	// Increment stateIndex to ensure completionHandler can only be called once.
 	stateIndex++;
 	
+    // 在信任的情况下，继续握手流程，否则关闭连接
 	if (shouldTrust)
 	{
         NSAssert(lastSSLHandshakeError == errSSLPeerAuthCompleted, @"ssl_shouldTrustPeer called when last error is %d and not errSSLPeerAuthCompleted", (int)lastSSLHandshakeError);
@@ -7599,6 +7663,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	
 	LogVerbose(@"Starting TLS (via CFStream)...");
 	
+    // 可读数据大于0，视为错误，关闭socket
 	if ([preBuffer availableBytes] > 0)
 	{
 		NSString *msg = @"Invalid TLS transition. Handshake has already been read from socket.";
@@ -7607,27 +7672,32 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
+    // 暂时挂起读写source
 	[self suspendReadSource];
 	[self suspendWriteSource];
 	
+    // 更新状态
 	socketFDBytesAvailable = 0;
 	flags &= ~kSocketCanAcceptBytes;
 	flags &= ~kSecureSocketHasBytesAvailable;
 	
 	flags |=  kUsingCFStreamForTLS;
 	
+    // 如果流已经存在，这里不会重复创建，而是直接返回yes
 	if (![self createReadAndWriteStream])
 	{
 		[self closeWithError:[self otherError:@"Error in CFStreamCreatePairWithSocket"]];
 		return;
 	}
 	
+    // 这里只是增加了kCFStreamEventHasBytesAvailable事件的监听，当有数据可读写时回调，CFStream形式的TLS读写是通过流触发的，而不是读写source
 	if (![self registerForStreamCallbacksIncludingReadWrite:YES])
 	{
 		[self closeWithError:[self otherError:@"Error in CFStreamSetClient"]];
 		return;
 	}
 	
+    // 如果已经添加到runloop，这里不再重新添加
 	if (![self addStreamsToRunLoop])
 	{
 		[self closeWithError:[self otherError:@"Error in CFStreamScheduleWithRunLoop"]];
@@ -7637,12 +7707,14 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	NSAssert([currentRead isKindOfClass:[GCDAsyncSpecialPacket class]], @"Invalid read packet for startTLS");
 	NSAssert([currentWrite isKindOfClass:[GCDAsyncSpecialPacket class]], @"Invalid write packet for startTLS");
 	
+    // 获取TLS设置
 	GCDAsyncSpecialPacket *tlsPacket = (GCDAsyncSpecialPacket *)currentRead;
 	CFDictionaryRef tlsSettings = (__bridge CFDictionaryRef)tlsPacket->tlsSettings;
 	
 	// Getting an error concerning kCFStreamPropertySSLSettings ?
 	// You need to add the CFNetwork framework to your iOS application.
 	
+    // 将TLS配置直接传给读写stream
 	BOOL r1 = CFReadStreamSetProperty(readStream, kCFStreamPropertySSLSettings, tlsSettings);
 	BOOL r2 = CFWriteStreamSetProperty(writeStream, kCFStreamPropertySSLSettings, tlsSettings);
 	
@@ -7671,12 +7743,14 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		return;
 	}
 	
+    // 如果已经打开流，这里直接返回yes
 	if (![self openStreams])
 	{
 		[self closeWithError:[self otherError:@"Error in CFStreamOpen"]];
 		return;
 	}
 	
+    // SSL握手将自动完成
 	LogVerbose(@"Waiting for SSL Handshake to complete...");
 }
 
@@ -7755,6 +7829,10 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 
 + (void)cfstreamThread:(id)unused { @autoreleasepool
 {
+    /**
+     启动该线程的runloop（读写流需要绑定到一个运行的runloop上）
+     runloop的运行依赖输入一个source，这里输入一个永远不会启动的timer
+     */
 	[[NSThread currentThread] setName:GCDAsyncSocketThreadName];
 	
 	LogInfo(@"CFStreamThread: Started");
@@ -7771,7 +7849,8 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	NSRunLoop *currentRunLoop = [NSRunLoop currentRunLoop];
 	
 	BOOL isCancelled = [currentThread isCancelled];
-	
+    
+	// 启动子线程的runloop
 	while (!isCancelled && [currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]])
 	{
 		isCancelled = [currentThread isCancelled];
@@ -8059,9 +8138,9 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 	{
 		LogVerbose(@"Adding streams to runloop...");
 		
-		[[self class] startCFStreamThreadIfNeeded];
+		[[self class] startCFStreamThreadIfNeeded]; // 创建子线程并启动子线程的runloop
         dispatch_sync(cfstreamThreadSetupQueue, ^{
-            [[self class] performSelector:@selector(scheduleCFStreams:)
+            [[self class] performSelector:@selector(scheduleCFStreams:) // 将读写流绑定到runloop上
                                  onThread:cfstreamThread
                                withObject:self
                             waitUntilDone:YES];
