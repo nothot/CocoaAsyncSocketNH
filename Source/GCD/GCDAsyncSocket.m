@@ -197,9 +197,10 @@ enum GCDAsyncSocketConfig
 
 @interface GCDAsyncSocketPreBuffer : NSObject
 {
-	uint8_t *preBuffer;
-	size_t preBufferSize;
-	
+	uint8_t *preBuffer; // buffer起始指针
+	size_t preBufferSize; // buffer开辟的空间大小
+    
+	// 读写指针
 	uint8_t *readPointer;
 	uint8_t *writePointer;
 }
@@ -239,6 +240,7 @@ enum GCDAsyncSocketConfig
 	if ((self = [super init]))
 	{
 		preBufferSize = numBytes;
+        // 初始时，三个指针指向同一个位置
 		preBuffer = malloc(preBufferSize);
 		
 		readPointer = preBuffer;
@@ -253,20 +255,25 @@ enum GCDAsyncSocketConfig
 		free(preBuffer);
 }
 
+/// 确保buffer拥有足够的空间为了写入
+/// - Parameter numBytes: 要写入的长度
 - (void)ensureCapacityForWrite:(size_t)numBytes
 {
 	size_t availableSpace = [self availableSpace];
 	
-	if (numBytes > availableSpace)
+	if (numBytes > availableSpace)  // 可用空间不够的情况下
 	{
 		size_t additionalBytes = numBytes - availableSpace;
 		
+        // 重新分配空间
 		size_t newPreBufferSize = preBufferSize + additionalBytes;
 		uint8_t *newPreBuffer = realloc(preBuffer, newPreBufferSize);
 		
+        // 计算读写指针的偏移
 		size_t readPointerOffset = readPointer - preBuffer;
 		size_t writePointerOffset = writePointer - preBuffer;
 		
+        // 更新指针指向
 		preBuffer = newPreBuffer;
 		preBufferSize = newPreBufferSize;
 		
@@ -293,8 +300,10 @@ enum GCDAsyncSocketConfig
 
 - (void)didRead:(size_t)bytesRead
 {
+    // 读取完毕之后更新读指针偏移
 	readPointer += bytesRead;
 	
+    // 如果读指针追上了写指针，说明已经没有额外数据可读了，直接将两个指针重新指向buffer起始位置
 	if (readPointer == writePointer)
 	{
 		// The prebuffer has been drained. Reset pointers.
@@ -305,6 +314,7 @@ enum GCDAsyncSocketConfig
 
 - (size_t)availableSpace
 {
+    // 总长度减去已经写入的长度=剩余可写入的长度
 	return preBufferSize - (writePointer - preBuffer);
 }
 
@@ -321,6 +331,7 @@ enum GCDAsyncSocketConfig
 
 - (void)didWrite:(size_t)bytesWritten
 {
+    // 写完后更新写指针偏移
 	writePointer += bytesWritten;
 }
 
@@ -4849,6 +4860,7 @@ enum GCDAsyncSocketConfig
 	
 	NSAssert((flags & kSocketSecure), @"Cannot flush ssl buffers on non-secure socket");
 	
+    // 在prebuffer为空的时候，才向其倾倒解密后的数据
 	if ([preBuffer availableBytes] > 0)
 	{
 		// Only flush the ssl buffers if the prebuffer is empty.
@@ -4861,16 +4873,22 @@ enum GCDAsyncSocketConfig
 	
 	if ([self usingCFStreamForTLS])
 	{
+        // 如果是CFStream形式的TLS，那么将数据从stream中拷贝到prebuffer
 		if ((flags & kSecureSocketHasBytesAvailable) && CFReadStreamHasBytesAvailable(readStream))
 		{
 			LogVerbose(@"%@ - Flushing ssl buffers into prebuffer...", THIS_METHOD);
 			
-			CFIndex defaultBytesToRead = (1024 * 4);
+			CFIndex defaultBytesToRead = (1024 * 4); // 单次拷贝4KB上限
 			
 			[preBuffer ensureCapacityForWrite:defaultBytesToRead];
 			
 			uint8_t *buffer = [preBuffer writeBuffer];
 			
+            /**
+             该方法会一直读，直到把stream中的数据全部读取出来
+             如果没有读取完下次有数据到来stream是不会触发有数据可读的事件回调的，必须调用该方法读完stream中的数据，
+             下次有新数据到来才会再次回调
+             */
 			CFIndex result = CFReadStreamRead(readStream, buffer, defaultBytesToRead);
 			LogVerbose(@"%@ - CFReadStreamRead(): result = %i", THIS_METHOD, (int)result);
 			
@@ -4887,6 +4905,9 @@ enum GCDAsyncSocketConfig
 	
 	#endif
 	
+    // 接下来处理SecureTransport形式的TLS
+    
+    // 计算预计可读的字节长度
 	__block NSUInteger estimatedBytesAvailable = 0;
 	
 	dispatch_block_t updateEstimatedBytesAvailable = ^{
@@ -4901,16 +4922,19 @@ enum GCDAsyncSocketConfig
 		// from the encrypted bytes in the sslPreBuffer.
 		// However, we do know this is an upper bound on the estimation.
 		
+        // 可读字节包括socket中未读的字节大小加上SSL buffer中缓存的字节大小
         estimatedBytesAvailable = self->socketFDBytesAvailable + [self->sslPreBuffer availableBytes];
 		
 		size_t sslInternalBufSize = 0;
         SSLGetBufferedReadSize(self->sslContext, &sslInternalBufSize);
 		
+        // 再加上SSL已经解密的字节大小
 		estimatedBytesAvailable += sslInternalBufSize;
 	};
 	
 	updateEstimatedBytesAvailable();
 	
+    // 如果有可读字节
 	if (estimatedBytesAvailable > 0)
 	{
 		LogVerbose(@"%@ - Flushing ssl buffers into prebuffer...", THIS_METHOD);
@@ -4920,7 +4944,7 @@ enum GCDAsyncSocketConfig
 		{
 			LogVerbose(@"%@ - estimatedBytesAvailable = %lu", THIS_METHOD, (unsigned long)estimatedBytesAvailable);
 			
-			// Make sure there's enough room in the prebuffer
+			// Make sure there's enough room in the prebuffer 首先prebuffer需要准备足够的空间
 			
 			[preBuffer ensureCapacityForWrite:estimatedBytesAvailable];
 			
@@ -4929,10 +4953,11 @@ enum GCDAsyncSocketConfig
 			uint8_t *buffer = [preBuffer writeBuffer];
 			size_t bytesRead = 0;
 			
+            // 从SSL context中读取解密后的数据到buffer中
 			OSStatus result = SSLRead(sslContext, buffer, (size_t)estimatedBytesAvailable, &bytesRead);
 			LogVerbose(@"%@ - read from secure socket = %u", THIS_METHOD, (unsigned)bytesRead);
 			
-			if (bytesRead > 0)
+			if (bytesRead > 0)  // 读取到字节
 			{
 				[preBuffer didWrite:bytesRead];
 			}
@@ -4941,17 +4966,18 @@ enum GCDAsyncSocketConfig
 			
 			if (result != noErr)
 			{
-				done = YES;
+				done = YES; // 读取成功结束while循环
 			}
 			else
 			{
-				updateEstimatedBytesAvailable();
+				updateEstimatedBytesAvailable();    // 读取失败则重新估算可读大小，继续读
 			}
 			
 		} while (!done && estimatedBytesAvailable > 0);
 	}
 }
 
+#pragma mark - 真正的读操作
 - (void)doReadData
 {
 	LogTrace();
@@ -4959,6 +4985,7 @@ enum GCDAsyncSocketConfig
 	// This method is called on the socketQueue.
 	// It might be called directly, or via the readSource when data is available to be read.
 	
+    // 如果当前读取的包为空，或者flag为读取停止,这两种情况是不能去读取数据的
 	if ((currentRead == nil) || (flags & kReadsPaused))
 	{
 		LogVerbose(@"No currentRead or kReadsPaused");
@@ -4981,6 +5008,11 @@ enum GCDAsyncSocketConfig
 			// So when a secure socket is closed, a "goodbye" packet comes across the wire.
 			// We want to make sure we read the "goodbye" packet so we can properly detect the TCP disconnection.
 			
+            /**
+             将SSL解密后的数据拷贝到prebufffer中，这个操作在读操作没进行的时候执行，原因有二
+             1. 用户没有触发读，也可能TLS安全连接已经有数据到达，那么完全可以提前解密数据，不必要等用户read的时候再去解密
+             2. 及时感知TLS的断链指令goodbye，处理断链
+             */
 			[self flushSSLBuffers];
 		}
 		
@@ -4997,7 +5029,7 @@ enum GCDAsyncSocketConfig
 			// If the readSource is not firing,
 			// we want it to continue monitoring the socket.
 			
-			if (socketFDBytesAvailable > 0)
+			if (socketFDBytesAvailable > 0) // 在有可读数据时，暂时挂起source
 			{
 				[self suspendReadSource];
 			}
@@ -5005,9 +5037,12 @@ enum GCDAsyncSocketConfig
 		return;
 	}
 	
+    // 接下来进入正式的数据读取流程
+    
 	BOOL hasBytesAvailable = NO;
 	unsigned long estimatedBytesAvailable = 0;
 	
+    // 判断是否有数据可读
 	if ([self usingCFStreamForTLS])
 	{
 		#if TARGET_OS_IPHONE
@@ -5024,6 +5059,16 @@ enum GCDAsyncSocketConfig
 	}
 	else
 	{
+        /*
+         安全传输形式的TLS数据流向
+         bsd socket -> ssl pre buffer -> 安全传输层内部buffer -> pre buffer -> 用户
+         
+         对应的数据加密状态
+         加密数据    -> 加密数据         -> 解密数据            -> 解密数据     -> 解密数据
+         
+         所以，预计可读字节大小等于
+         bsd socket 可读字节大小 + ssl prebuffer大小 + 安全传输层内部buffer大小
+        */
 		estimatedBytesAvailable = socketFDBytesAvailable;
 		
 		if (flags & kSocketSecure)
@@ -5065,13 +5110,14 @@ enum GCDAsyncSocketConfig
 		hasBytesAvailable = (estimatedBytesAvailable > 0);
 	}
 	
+    // 没有数据可读，且prebuffer中也没有数据了
 	if ((hasBytesAvailable == NO) && ([preBuffer availableBytes] == 0))
 	{
 		LogVerbose(@"No data available to read...");
 		
 		// No data available to read.
 		
-		if (![self usingCFStreamForTLS])
+		if (![self usingCFStreamForTLS]) // 对于安全传输形式的TLS，需要resume source
 		{
 			// Need to wait for readSource to fire and notify us of
 			// available data in the socket's internal read buffer.
@@ -5118,6 +5164,16 @@ enum GCDAsyncSocketConfig
 	
 	NSUInteger totalBytesReadForCurrentRead = 0;
 	
+    /*
+     ******************************************************************************************
+     
+     前面依旧是TLS相关的预处理操作，从这里开始，进入从prebuffer向用户吐数据的流程
+     对用户来说，一个read任务完成，有三种终止条件
+     1. 读完所有可读的数据
+     2. 读完指定长度的数据
+     3. 读至指定终止符号的数据
+     */
+    
 	// 
 	// STEP 1 - READ FROM PREBUFFER
 	// 
@@ -5132,6 +5188,7 @@ enum GCDAsyncSocketConfig
 		
 		NSUInteger bytesToCopy;
 		
+        // 计算要拷贝的字节长度
 		if (currentRead->term != nil)
 		{
 			// Read type #3 - read up to a terminator
@@ -5151,9 +5208,10 @@ enum GCDAsyncSocketConfig
 		
 		// Copy bytes from prebuffer into packet buffer
 		
+        // 获取当前read的buffer指针可写的位置
 		uint8_t *buffer = (uint8_t *)[currentRead->buffer mutableBytes] + currentRead->startOffset +
 		                                                                  currentRead->bytesDone;
-		
+		// 将prebuffer中的数据拷贝的read任务的buffer，后续交给用户
 		memcpy(buffer, [preBuffer readBuffer], bytesToCopy);
 		
 		// Remove the copied bytes from the preBuffer
@@ -5166,13 +5224,13 @@ enum GCDAsyncSocketConfig
 		currentRead->bytesDone += bytesToCopy;
 		totalBytesReadForCurrentRead += bytesToCopy;
 		
-		// Check to see if the read operation is done
+		// Check to see if the read operation is done 检查读任务是否完成
 		
 		if (currentRead->readLength > 0)
 		{
 			// Read type #2 - read a specific length of data
 			
-			done = (currentRead->bytesDone == currentRead->readLength);
+			done = (currentRead->bytesDone == currentRead->readLength);   // 已读长度等于要读的长度，说明读任务完成
 		}
 		else if (currentRead->term != nil)
 		{
@@ -5185,7 +5243,7 @@ enum GCDAsyncSocketConfig
 				// We're not done and there's a set maxLength.
 				// Have we reached that maxLength yet?
 				
-				if (currentRead->bytesDone >= currentRead->maxLength)
+				if (currentRead->bytesDone >= currentRead->maxLength)   // 已读长度超过了设置的最大读取长度，溢出了，抛出错误
 				{
 					error = [self readMaxedOutError];
 				}
@@ -5199,11 +5257,14 @@ enum GCDAsyncSocketConfig
 			// - we've read all available data (in prebuffer and socket)
 			// - we've read the maxLength of read packet.
 			
-			done = ((currentRead->maxLength > 0) && (currentRead->bytesDone == currentRead->maxLength));
+			done = ((currentRead->maxLength > 0) && (currentRead->bytesDone == currentRead->maxLength)); // 已读长度达到了最大读取长度，读完了
 		}
 		
 	}
 	
+    /**
+     如果prebuffer读空了，然而read任务依旧没有完成，那么继续从socket读数据
+     */
 	// 
 	// STEP 2 - READ FROM SOCKET
 	// 
@@ -5211,6 +5272,7 @@ enum GCDAsyncSocketConfig
 	BOOL socketEOF = (flags & kSocketHasReadEOF) ? YES : NO;  // Nothing more to read via socket (end of file)
 	BOOL waiting   = !done && !error && !socketEOF && !hasBytesAvailable; // Ran out of data, waiting for more
 	
+    // 如果read任务没完成，且没出错，没读到socket结尾，socket有可读数据
 	if (!done && !error && !socketEOF && hasBytesAvailable)
 	{
 		NSAssert(([preBuffer availableBytes] == 0), @"Invalid logic");
@@ -5382,8 +5444,13 @@ enum GCDAsyncSocketConfig
 		}
 		else
 		{
-			// Normal socket operation
+			// Normal socket operation 普通的未加密的socket数据读取操作
 			
+            /*
+             同从prebuffer读数据类似，依旧是先计算可以读取的字节长度，readIntoPreBuffer表明是否需要先读进临时buffer，然后再拷贝到read
+             核心策略：
+             如果read指定了读取长度，直接读入read，如果未指定，但read可写空间大于可以读的字节长度，也直接读入read，否则，先读入prebuffer缓冲一下
+             */
 			NSUInteger bytesToRead;
 			
 			// There are 3 types of read packets:
@@ -5415,6 +5482,7 @@ enum GCDAsyncSocketConfig
 			// We are either reading directly into the currentRead->buffer,
 			// or we're reading into the temporary preBuffer.
 			
+            // 获取要写入到的buffer指针，这里根据是否先写入到临时buffer得到不同的buffer指针
 			if (readIntoPreBuffer)
 			{
 				[preBuffer ensureCapacityForWrite:bytesToRead];
@@ -5434,11 +5502,13 @@ enum GCDAsyncSocketConfig
 			
 			int socketFD = (socket4FD != SOCKET_NULL) ? socket4FD : (socket6FD != SOCKET_NULL) ? socket6FD : socketUN;
 			
+            // 从bsd socket读数据
 			ssize_t result = read(socketFD, buffer, (size_t)bytesToRead);
 			LogVerbose(@"read from socket = %i", (int)result);
 			
 			if (result < 0)
 			{
+                // 如果遇到IO阻塞，那么标记等待
 				if (errno == EWOULDBLOCK)
 					waiting = YES;
 				else
@@ -5446,7 +5516,7 @@ enum GCDAsyncSocketConfig
 				
 				socketFDBytesAvailable = 0;
 			}
-			else if (result == 0)
+			else if (result == 0)   // 读到了socket文件尾
 			{
 				socketEOF = YES;
 				socketFDBytesAvailable = 0;
@@ -5455,7 +5525,7 @@ enum GCDAsyncSocketConfig
 			{
 				bytesRead = result;
 				
-				if (bytesRead < bytesToRead)
+				if (bytesRead < bytesToRead)    // 没读到期望的长度，但socket没数据了
 				{
 					// The read returned less data than requested.
 					// This means socketFDBytesAvailable was a bit off due to timing,
@@ -5464,6 +5534,7 @@ enum GCDAsyncSocketConfig
 				}
 				else
 				{
+                    // 更新socketFDBytesAvailable
 					if (socketFDBytesAvailable <= bytesRead)
 						socketFDBytesAvailable = 0;
 					else
@@ -5472,16 +5543,16 @@ enum GCDAsyncSocketConfig
 				
 				if (socketFDBytesAvailable == 0)
 				{
-					waiting = YES;
+					waiting = YES;  // socket 没有剩余，标记需要等待
 				}
 			}
 		}
 		
-		if (bytesRead > 0)
+		if (bytesRead > 0) // 已经读取了若干长度字节的数据，这里判断是否当前read任务完成了
 		{
 			// Check to see if the read operation is done
 			
-			if (currentRead->readLength > 0)
+			if (currentRead->readLength > 0) // 如果指定了长度，那么需要看读取的长度是否达到了指定长度
 			{
 				// Read type #2 - read a specific length of data
 				// 
@@ -5494,7 +5565,7 @@ enum GCDAsyncSocketConfig
 				
 				done = (currentRead->bytesDone == currentRead->readLength);
 			}
-			else if (currentRead->term != nil)
+			else if (currentRead->term != nil)  // 如果指定了读取终止结束符，
 			{
 				// Read type #3 - read up to a terminator
 				
@@ -5596,9 +5667,9 @@ enum GCDAsyncSocketConfig
 			}
 			else
 			{
-				// Read type #1 - read all available data
+				// Read type #1 - read all available data 对于一次性把所有可读数据读出的情况，判断是否先读进了临时缓存
 				
-				if (readIntoPreBuffer)
+				if (readIntoPreBuffer)  // 读进了临时缓存，那么从临时缓存再拷贝到read的buffer里
 				{
 					// We just read a chunk of data into the preBuffer
 					
@@ -5652,7 +5723,7 @@ enum GCDAsyncSocketConfig
 	
 	// Check to see if we're done, or if we've made progress
 	
-	if (done)
+	if (done)   // 如果读完了，任务完成，那么回调代理读到的数据，并停止读超时计时器，将当前read置空
 	{
 		[self completeCurrentRead];
 		
@@ -5661,7 +5732,7 @@ enum GCDAsyncSocketConfig
 			[self maybeDequeueRead];
 		}
 	}
-	else if (totalBytesReadForCurrentRead > 0)
+	else if (totalBytesReadForCurrentRead > 0)  // 没有完成read任务但已经读了若干字节，通知代理进度
 	{
 		// We're not done read type #2 or #3 yet, but we have read in some bytes
 		//
@@ -5688,13 +5759,13 @@ enum GCDAsyncSocketConfig
 	
 	if (error)
 	{
-		[self closeWithError:error];
+		[self closeWithError:error];    // 读取出错，关闭socket
 	}
 	else if (socketEOF)
 	{
-		[self doReadEOF];
+		[self doReadEOF];   // 读到socket文件尾的处理
 	}
-	else if (waiting)
+	else if (waiting)   // 这种情况意味着还需要继续读，read任务并未完成，因此进行必要的resume source
 	{
 		if (![self usingCFStreamForTLS])
 		{
@@ -5714,15 +5785,16 @@ enum GCDAsyncSocketConfig
 	// If the EOF is read while there is still data in the preBuffer,
 	// then this method may be called continually after invocations of doReadData to see if it's time to disconnect.
 	
-	flags |= kSocketHasReadEOF;
+	flags |= kSocketHasReadEOF; // 更新状态
 	
-	if (flags & kSocketSecure)
+	if (flags & kSocketSecure)  // 如果是安全连接，那么把ssl buffer中的数据移入pre buffer
 	{
 		// If the SSL layer has any buffered data, flush it into the preBuffer now.
 		
 		[self flushSSLBuffers];
 	}
 	
+    // 判断是否需要断链
 	BOOL shouldDisconnect = NO;
 	NSError *error = nil;
 	
@@ -5731,6 +5803,7 @@ enum GCDAsyncSocketConfig
 		// We received an EOF during or prior to startTLS.
 		// The SSL/TLS handshake is now impossible, so this is an unrecoverable situation.
 		
+        // 对于正在开启TLS连接的场景，收到了EOF，那么握手是不能完成的，视为需要断链
 		shouldDisconnect = YES;
 		
 		if ([self usingSecureTransportForTLS])
@@ -5738,7 +5811,7 @@ enum GCDAsyncSocketConfig
 			error = [self sslError:errSSLClosedAbort];
 		}
 	}
-	else if (flags & kReadStreamClosed)
+	else if (flags & kReadStreamClosed) // 读流关闭的状态，这种情况视为半双工连接，即不可读但可写，不断链
 	{
 		// The preBuffer has already been drained.
 		// The config allows half-duplex connections.
@@ -5750,7 +5823,7 @@ enum GCDAsyncSocketConfig
 		
 		shouldDisconnect = NO;
 	}
-	else if ([preBuffer availableBytes] > 0)
+	else if ([preBuffer availableBytes] > 0)    // socket已不能再读数据，但prebuffer中尚有数据可读，不断链
 	{
 		LogVerbose(@"Socket reached EOF, but there is still data available in prebuffer");
 		
@@ -5759,7 +5832,7 @@ enum GCDAsyncSocketConfig
 		
 		shouldDisconnect = NO;
 	}
-	else if (config & kAllowHalfDuplexConnection)
+	else if (config & kAllowHalfDuplexConnection)   // 如果允许半双工连接，那么需要监测一下
 	{
 		// We just received an EOF (end of file) from the socket's read stream.
 		// This means the remote end of the socket (the peer we're connected to)
@@ -5769,14 +5842,19 @@ enum GCDAsyncSocketConfig
 		
 		int socketFD = (socket4FD != SOCKET_NULL) ? socket4FD : (socket6FD != SOCKET_NULL) ? socket6FD : socketUN;
 		
+        /**
+         poll函数使用pollfd类型的结构来监控一组文件句柄，ufds是要监控的文件句柄集合，nfds是监控的文件句柄数量，timeout是等待的毫秒数，这段时间内无论I/O是否准备好，poll都会返回。timeout为负数表示无线等待，timeout为0表示调用后立即返回。执行结果：为0表示超时前没有任何事件发生；-1表示失败；成功则返回结构体中revents不为0的文件描述符个数。pollfd结构监控的事件类型如下：
+
+                  int poll(struct pollfd *ufds, unsigned int nfds, int timeout);
+         */
 		struct pollfd pfd[1];
-		pfd[0].fd = socketFD;
-		pfd[0].events = POLLOUT;
-		pfd[0].revents = 0;
+		pfd[0].fd = socketFD;// //文件描述符
+		pfd[0].events = POLLOUT;    // 要查询的事件掩码
+		pfd[0].revents = 0; // 返回的事件掩码
 		
 		poll(pfd, 1, 0);
 		
-		if (pfd[0].revents & POLLOUT)
+		if (pfd[0].revents & POLLOUT)   // 如果触发的事件是写数据，那么意味着socket仍然可写，此时只关闭读stream，保持半双工连接，通知代理
 		{
 			// Socket appears to still be writeable
 			
@@ -5797,7 +5875,7 @@ enum GCDAsyncSocketConfig
 		}
 		else
 		{
-			shouldDisconnect = YES;
+			shouldDisconnect = YES; // 如果也不可写，那么需要断链了
 		}
 	}
 	else
@@ -5805,7 +5883,7 @@ enum GCDAsyncSocketConfig
 		shouldDisconnect = YES;
 	}
 	
-	
+	// 需要断链就关闭socket，否则只是挂起read source，继续保持写stream
 	if (shouldDisconnect)
 	{
 		if (error == nil)
@@ -5907,6 +5985,9 @@ enum GCDAsyncSocketConfig
 {
 	if (timeout >= 0.0)
 	{
+        /**
+         这里使用source而不是NSTimer，是因为后者是基于runloop的，而socket queue作为子线程并未开启runloop
+         */
 		readTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, socketQueue);
 		
 		__weak GCDAsyncSocket *weakSelf = self;
@@ -5950,6 +6031,13 @@ enum GCDAsyncSocketConfig
 	// But if we do so synchronously we risk a possible deadlock.
 	// So instead we have to do so asynchronously, and callback to ourselves from within the delegate block.
 	
+    /**
+     处理读数据超时的情况
+     首先修改状态为暂停读数据
+     然后，询问代理是否要延长超时时间，
+     如果代理返回值>0，意味着允许延长超时时间，则更新当前read的超时时间重启读超时计时器，在延长的时间内继续完成当前read
+     如果代理返回值小于等于0，则视为超时错误，关闭socket
+     */
 	flags |= kReadsPaused;
 	
 	__strong id<GCDAsyncSocketDelegate> theDelegate = delegate;
@@ -5992,6 +6080,7 @@ enum GCDAsyncSocketConfig
 			
 			// Unpause reads, and continue
 			flags &= ~kReadsPaused;
+            // 更新了超时时间，继续当前read
 			[self doReadData];
 		}
 		else
@@ -6959,6 +7048,10 @@ enum GCDAsyncSocketConfig
 	return errSSLWouldBlock;
 }
 
+/**
+ 安全传输层通过此回调向我们索要加密的数据，这个数据我们从bsd socket读入到ssl prebuffer，现在会再次被读到系统传递过来的data指针里，然后系统进行解密数据,
+ 在sslread的时候，解密的数据从安全传输层内部的buffer里传递到我们的prebuffer里，当然也可能直接传递到read任务的buffer里
+ */
 static OSStatus SSLReadFunction(SSLConnectionRef connection, void *data, size_t *dataLength)
 {
 	GCDAsyncSocket *asyncSocket = (__bridge GCDAsyncSocket *)connection;
