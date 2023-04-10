@@ -829,10 +829,10 @@ enum GCDAsyncSocketConfig
 @interface GCDAsyncWritePacket : NSObject
 {
   @public
-	NSData *buffer;
-	NSUInteger bytesDone;
-	long tag;
-	NSTimeInterval timeout;
+	NSData *buffer; // 写缓存
+	NSUInteger bytesDone; // 已写入字节长度
+	long tag;   // 写任务标签
+	NSTimeInterval timeout; // 写超时
 }
 - (instancetype)initWithData:(NSData *)d timeout:(NSTimeInterval)t tag:(long)i NS_DESIGNATED_INITIALIZER;
 @end
@@ -866,6 +866,7 @@ enum GCDAsyncSocketConfig
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
+ * 特殊packet任务，可插入到读写队列里中断读写，执行特殊的指令，目前用于tls安全通信
  * The GCDAsyncSpecialPacket encompasses special instructions for interruptions in the read/write queues.
  * This class my be altered to support more than just TLS in the future.
 **/
@@ -954,7 +955,7 @@ enum GCDAsyncSocketConfig
 #endif
 	SSLContextRef sslContext;// SSL上下文，用来做SSL认证
 	GCDAsyncSocketPreBuffer *sslPreBuffer;// 专门用于ssl的全局预缓冲区
-	size_t sslWriteCachedLength;
+	size_t sslWriteCachedLength; // ssl内部缓存保留的缓存数据长度
 	OSStatus sslErrCode;// 记录SSL读取数据错误
     OSStatus lastSSLHandshakeError;// 记录SSL握手的错误
 	
@@ -4966,11 +4967,11 @@ enum GCDAsyncSocketConfig
 			
 			if (result != noErr)
 			{
-				done = YES; // 读取成功结束while循环
+				done = YES; // 读取失败结束while循环
 			}
 			else
 			{
-				updateEstimatedBytesAvailable();    // 读取失败则重新估算可读大小，继续读
+				updateEstimatedBytesAvailable();    // 读取成功则重新估算可读大小，继续读
 			}
 			
 		} while (!done && estimatedBytesAvailable > 0);
@@ -6093,13 +6094,17 @@ enum GCDAsyncSocketConfig
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#pragma mark Writing
+#pragma mark Writing ====================================写数据
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 - (void)writeData:(NSData *)data withTimeout:(NSTimeInterval)timeout tag:(long)tag
 {
 	if ([data length] == 0) return;
 	
+    /**
+     这里创建一个写任务，封装了外部的一个写请求
+     data是外部要写入的数据，timeout为外部设置的超时时间
+     */
 	GCDAsyncWritePacket *packet = [[GCDAsyncWritePacket alloc] initWithData:data timeout:timeout tag:tag];
 	
 	dispatch_async(socketQueue, ^{ @autoreleasepool {
@@ -6108,6 +6113,7 @@ enum GCDAsyncSocketConfig
 		
         if ((self->flags & kSocketStarted) && !(self->flags & kForbidReadsWrites))
 		{
+            // 如果socket进入start状态且没有被禁止写，则放写任务到队列，并尝试出队一个写任务
             [self->writeQueue addObject:packet];
 			[self maybeDequeueWrite];
 		}
@@ -6155,6 +6161,7 @@ enum GCDAsyncSocketConfig
 }
 
 /**
+ *  有条件的执行一个写操作
  * Conditionally starts a new write.
  * 
  * It is called when:
@@ -6169,22 +6176,29 @@ enum GCDAsyncSocketConfig
 	LogTrace();
 	NSAssert(dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey), @"Must be dispatched on socketQueue");
 	
-	
+	// 如果当前没有写任务，且socket处于连接状态，那么可以尝试开启一个新的写任务
 	// If we're not currently processing a write AND we have an available write stream
 	if ((currentWrite == nil) && (flags & kConnected))
 	{
+        // 在写任务队列存在要执行的任务时，取出一个
 		if ([writeQueue count] > 0)
 		{
 			// Dequeue the next object in the write queue
 			currentWrite = [writeQueue objectAtIndex:0];
 			[writeQueue removeObjectAtIndex:0];
 			
-			
+			/**
+             如果当前取到的packet是特殊的packet（tls），那么执行开启TLS的操作
+             */
 			if ([currentWrite isKindOfClass:[GCDAsyncSpecialPacket class]])
 			{
 				LogVerbose(@"Dequeued GCDAsyncSpecialPacket");
 				
 				// Attempt to start TLS
+                /**
+                 标记当前写进入TLS
+                 当开启TLS时，会向读写队列均插入一个特殊的任务，用于开启TLS
+                 */
 				flags |= kStartingWriteTLS;
 				
 				// This method won't do anything unless both kStartingReadTLS and kStartingWriteTLS are set
@@ -6194,17 +6208,21 @@ enum GCDAsyncSocketConfig
 			{
 				LogVerbose(@"Dequeued GCDAsyncWritePacket");
 				
-				// Setup write timer (if needed)
+				// Setup write timer (if needed)    如果设置了写超时，那么创建写超时计时器
 				[self setupWriteTimerWithTimeout:currentWrite->timeout];
 				
-				// Immediately write, if possible
+				// Immediately write, if possible 执行实际的写操作
 				[self doWriteData];
 			}
 		}
-		else if (flags & kDisconnectAfterWrites)
+		else if (flags & kDisconnectAfterWrites) // 如果当前没有执行写任务，而队列里也没有写任务待执行，那么判断是否需要【写完断链】
 		{
+            /**
+             如果需要【写完断链】，那么再判断下是否需要【读完断链】，如果不需要，直接执行断链操作
+             */
 			if (flags & kDisconnectAfterReads)
 			{
+                // 如果需要，那么需要等待没有读任务后，再执行断链操作
 				if (([readQueue count] == 0) && (currentRead == nil))
 				{
 					[self closeWithError:nil];
@@ -6218,6 +6236,7 @@ enum GCDAsyncSocketConfig
 	}
 }
 
+#pragma mark - 真正写数据的方法
 - (void)doWriteData
 {
 	LogTrace();
@@ -6226,17 +6245,20 @@ enum GCDAsyncSocketConfig
 	
 	if ((currentWrite == nil) || (flags & kWritesPaused))
 	{
+        // 当前没有进行中的写任务，并且socket是暂停写的状态，意味着当前不可以写
 		LogVerbose(@"No currentWrite or kWritesPaused");
 		
 		// Unable to write at this time
 		
 		if ([self usingCFStreamForTLS])
 		{
+            // 如果当前是CFStream，那么无需操作
 			// CFWriteStream only fires once when there is available data.
 			// It won't fire again until we've invoked CFWriteStreamWrite.
 		}
 		else
 		{
+            // 当前是安全传输形式的TLS，那么如果可以写入，先挂起source，避免写source频繁触发
 			// If the writeSource is firing, we need to pause it
 			// or else it will continue to fire over and over again.
 			
@@ -6248,6 +6270,9 @@ enum GCDAsyncSocketConfig
 		return;
 	}
 	
+    /**
+     如果当前socket不可以再写入了，那么如果当前不是CFStream形式的TLS，那么resume source，等待写source告诉我们有可用空间写入了再行写入
+     */
 	if (!(flags & kSocketCanAcceptBytes))
 	{
 		LogVerbose(@"No space available to write...");
@@ -6272,6 +6297,10 @@ enum GCDAsyncSocketConfig
 		
 		if (flags & kStartingReadTLS)
 		{
+            /**
+             如果读写都处于开启TLS状态，那么对于errSSLWouldBlock这种情况，意味着当前还在握手的流程中，我们
+             需要再次调用握手函数
+             */
 			if ([self usingSecureTransportForTLS] && lastSSLHandshakeError == errSSLWouldBlock)
 			{
 				// We are in the process of a SSL Handshake.
@@ -6302,18 +6331,19 @@ enum GCDAsyncSocketConfig
 	NSError *error = nil;
 	size_t bytesWritten = 0;
 	
-	if (flags & kSocketSecure)
+	if (flags & kSocketSecure) // 开启了安全通信
 	{
-		if ([self usingCFStreamForTLS])
+		if ([self usingCFStreamForTLS]) // 使用CFStream形式的TLS安全连接
 		{
 			#if TARGET_OS_IPHONE
 			
 			// 
 			// Writing data using CFStream (over internal TLS)
 			// 
-			
+			// 获取写指针
 			const uint8_t *buffer = (const uint8_t *)[currentWrite->buffer bytes] + currentWrite->bytesDone;
 			
+            // 获取要写入的字节长度
 			NSUInteger bytesToWrite = [currentWrite->buffer length] - currentWrite->bytesDone;
 			
 			if (bytesToWrite > SIZE_MAX) // NSUInteger may be bigger than size_t (write param 3)
@@ -6321,6 +6351,7 @@ enum GCDAsyncSocketConfig
 				bytesToWrite = SIZE_MAX;
 			}
 		
+            // 将数据从buffer里写入到write stream，写入长度为bytesToWrite
 			CFIndex result = CFWriteStreamWrite(writeStream, buffer, (CFIndex)bytesToWrite);
 			LogVerbose(@"CFWriteStreamWrite(%lu) = %li", (unsigned long)bytesToWrite, result);
 		
@@ -6330,18 +6361,22 @@ enum GCDAsyncSocketConfig
 			}
 			else
 			{
+                // 写入成功，更新已写入的字节长度
 				bytesWritten = (size_t)result;
 				
 				// We always set waiting to true in this scenario.
 				// CFStream may have altered our underlying socket to non-blocking.
 				// Thus if we attempt to write without a callback, we may end up blocking our queue.
-				waiting = YES;
+				waiting = YES;  // 标记需要等待，等socket消化掉数据，腾出空间然后就可以接着执行外部的写操作了
 			}
 			
 			#endif
 		}
 		else
 		{
+            // ================================================================================
+            // 接下来是使用安全传输形式的TLS写入操作
+            
 			// We're going to use the SSLWrite function.
 			// 
 			// OSStatus SSLWrite(SSLContextRef context, const void *data, size_t dataLength, size_t *processed)
@@ -6384,22 +6419,35 @@ enum GCDAsyncSocketConfig
 			// For this purpose we're going to break large writes into a series of smaller writes.
 			// This allows us to report progress back to the delegate.
 			
+            /**
+             通过ssl write数据会被加密写进socket，但ssl write一次可能并不能将我们传入的指定长度的数据写入完成，这种情况
+             会触发IO阻塞，函数返回时我们的数据并没有写完，数据会被放置在ssl 内部的IO缓存中
+             当我们通过ssl write调用继续写入新数据时，ssl会先接着写自己缓存中的数据，然后再写新数据
+             当我们通过ssl write调用传入null时，ssl依旧会继续写自己缓存中的数据
+             鉴于此，我们将一次较大的写入分成多次少量的写入，以便方便知道写入进度
+             */
 			OSStatus result;
 			
+            // 是否有要写的缓存的数据
 			BOOL hasCachedDataToWrite = (sslWriteCachedLength > 0);
+            // 是否有新的数据要写
 			BOOL hasNewDataToWrite = YES;
 			
-			if (hasCachedDataToWrite)
+			if (hasCachedDataToWrite) // 如果当前还有缓存的数据要写，要先将缓存中的数据写完，才继续向ssl写新数据
 			{
 				size_t processed = 0;
 				
+                // 调用ssl write写数据，这里传空指针的原因是ssl内部buffer已经缓存了数据
 				result = SSLWrite(sslContext, NULL, 0, &processed);
 				
 				if (result == noErr)
 				{
+                    /**
+                     已经完成写入，待写的在ssl内部缓存中的数据长度更新为0
+                     */
 					bytesWritten = sslWriteCachedLength;
 					sslWriteCachedLength = 0;
-					
+					// 已写的字节加本次写入的长度=写任务buffer的长度，视为写任务完成
 					if ([currentWrite->buffer length] == (currentWrite->bytesDone + bytesWritten))
 					{
 						// We've written all data for the current write.
@@ -6410,6 +6458,7 @@ enum GCDAsyncSocketConfig
 				{
 					if (result == errSSLWouldBlock)
 					{
+                        // 这种情况意味着写入尚未完成，传入的数据只写入了一部分，还需等待继续写入
 						waiting = YES;
 					}
 					else
@@ -6417,17 +6466,20 @@ enum GCDAsyncSocketConfig
 						error = [self sslError:result];
 					}
 					
+                    // 无论是以上哪种情况（出错或者block），我们都不能再写入新的数据了
 					// Can't write any new data since we were unable to write the cached data.
 					hasNewDataToWrite = NO;
 				}
 			}
 			
+            // 处理完ssl已缓存的数据，如果有新的数据要写，那么从写任务读取一部分数据，向ssl写入
 			if (hasNewDataToWrite)
 			{
+                // 获取写任务中buffer的起始位置
 				const uint8_t *buffer = (const uint8_t *)[currentWrite->buffer bytes]
 				                                        + currentWrite->bytesDone
 				                                        + bytesWritten;
-				
+				// 获取要写入的长度
 				NSUInteger bytesToWrite = [currentWrite->buffer length] - currentWrite->bytesDone - bytesWritten;
 				
 				if (bytesToWrite > SIZE_MAX) // NSUInteger may be bigger than size_t (write param 3)
@@ -6437,6 +6489,9 @@ enum GCDAsyncSocketConfig
 				
 				size_t bytesRemaining = bytesToWrite;
 				
+                /**
+                 将一次要写入的大的长度分多次少量的向ssl写入
+                 */
 				BOOL keepLooping = YES;
 				while (keepLooping)
 				{
@@ -6448,6 +6503,7 @@ enum GCDAsyncSocketConfig
 					
 					if (result == noErr)
 					{
+                        // 写入完成，则更新buffer偏移，以及已写和待写长度，待写长度>0则继续循环
 						buffer += sslBytesWritten;
 						bytesWritten += sslBytesWritten;
 						bytesRemaining -= sslBytesWritten;
@@ -6456,16 +6512,18 @@ enum GCDAsyncSocketConfig
 					}
 					else
 					{
+                        // 写入遇到errSSLWouldBlock，数据没写完，但并没有出错，只是目前只写入了一部分，那么需要等待
 						if (result == errSSLWouldBlock)
 						{
 							waiting = YES;
-							sslWriteCachedLength = sslBytesToWrite;
+							sslWriteCachedLength = sslBytesToWrite; // ssl 内部缓存长度更新为本次要写入的长度
 						}
 						else
 						{
 							error = [self sslError:result];
 						}
-						
+						// 无论是哪种情况，都不需要继续循环，对于block的情况，外部需要等待不能再写入新数据，我们需要等source
+                        // 触发下一次的do write然后我们执行缓存数据的继续写入【hasCachedDataToWrite】
 						keepLooping = NO;
 					}
 					
@@ -6473,9 +6531,11 @@ enum GCDAsyncSocketConfig
 				
 			} // if (hasNewDataToWrite)
 		}
+        // 以上是开启了安全通信情况的写入逻辑
 	}
 	else
 	{
+        // 未开启TLS，那么我们直接向socket写入数据
 		// 
 		// Writing data directly over raw socket
 		// 
@@ -6491,6 +6551,7 @@ enum GCDAsyncSocketConfig
 			bytesToWrite = SIZE_MAX;
 		}
 		
+        // 向bsd socket写入数据
 		ssize_t result = write(socketFD, buffer, (size_t)bytesToWrite);
 		LogVerbose(@"wrote to socket = %zd", result);
 		
@@ -6499,15 +6560,18 @@ enum GCDAsyncSocketConfig
 		{
 			if (errno == EWOULDBLOCK)
 			{
+                // 遇到block，当前不可继续写入新数据了，需要等待
 				waiting = YES;
 			}
 			else
 			{
+                // 写入出错
 				error = [self errorWithErrno:errno reason:@"Error in write() function"];
 			}
 		}
 		else
 		{
+            // 写入完成，更新已写字节
 			bytesWritten = result;
 		}
 	}
@@ -6523,10 +6587,12 @@ enum GCDAsyncSocketConfig
 	
 	if (waiting)
 	{
+        // 如果需要等待，标记当前socket为不可接受写新数据的状态
 		flags &= ~kSocketCanAcceptBytes;
 		
 		if (![self usingCFStreamForTLS])
 		{
+            // 安全传输TLS，我们需要resume source，继续监听source可写时的触发
 			[self resumeWriteSource];
 		}
 	}
@@ -6534,7 +6600,7 @@ enum GCDAsyncSocketConfig
 	// Check our results
 	
 	BOOL done = NO;
-	
+	// 计算当前已写入的字节长度是否达到了写任务的数据长度，判断写任务是否完成
 	if (bytesWritten > 0)
 	{
 		// Update total amount read for the current write
@@ -6547,10 +6613,17 @@ enum GCDAsyncSocketConfig
 	
 	if (done)
 	{
+        /**
+         写任务完成
+         通知代理写入完成
+         取消写任务超时检测计时器
+         设置当前写任务为空
+         */
 		[self completeCurrentWrite];
 		
 		if (!error)
 		{
+            // 没有出错的情况下，我们继续尝试取下一个写任务
 			dispatch_async(socketQueue, ^{ @autoreleasepool{
 				
 				[self maybeDequeueWrite];
@@ -6561,21 +6634,22 @@ enum GCDAsyncSocketConfig
 	{
 		// We were unable to finish writing the data,
 		// so we're waiting for another callback to notify us of available space in the lower-level output buffer.
-		
+		// 写任务没有完成，但是没有出错，也没有置为等待状态，我们只写入了一部分数据
 		if (!waiting && !error)
 		{
 			// This would be the case if our write was able to accept some data, but not all of it.
-			
+			// 标记当前socket为不可接受写新数据的状态
 			flags &= ~kSocketCanAcceptBytes;
 			
 			if (![self usingCFStreamForTLS])
 			{
-				[self resumeWriteSource];
+				[self resumeWriteSource];   // resume source，自动触发下次写操作
 			}
 		}
 		
 		if (bytesWritten > 0)
 		{
+            // 没有写完全部数据，但写入了一部分，我们通知代理写入进度
 			// We're not done with the entire write, but we have written some bytes
 			
 			__strong id<GCDAsyncSocketDelegate> theDelegate = delegate;
@@ -6594,6 +6668,7 @@ enum GCDAsyncSocketConfig
 	
 	// Check for errors
 	
+    // 以上操作，如果出现错误，那么关闭socket
 	if (error)
 	{
 		[self closeWithError:[self errorWithErrno:errno reason:@"Error in write() function"]];
